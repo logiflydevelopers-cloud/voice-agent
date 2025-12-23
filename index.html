@@ -1,53 +1,45 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <title>Voice AI Call</title>
+<meta charset="UTF-8">
+<title>Voice AI Call</title>
 
-  <style>
-    body {
-      background: #0f172a;
-      color: #fff;
-      font-family: Arial;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      height: 100vh;
-    }
-    .box {
-      background: #020617;
-      width: 360px;
-      padding: 25px;
-      border-radius: 14px;
-    }
-    button {
-      width: 100%;
-      padding: 16px;
-      font-size: 18px;
-      border: none;
-      border-radius: 40px;
-      cursor: pointer;
-    }
-    .start { background: #22c55e; }
-    .stop { background: #ef4444; color: #fff; }
-    .log {
-      margin-top: 15px;
-      font-size: 14px;
-      max-height: 200px;
-      overflow: auto;
-    }
-    .user { color: #38bdf8; }
-    .ai { color: #a7f3d0; }
-    .status { opacity: .8; margin-top: 8px; }
-  </style>
+<style>
+body{
+  background:#0f172a;
+  color:#fff;
+  font-family:Arial;
+  display:flex;
+  justify-content:center;
+  align-items:center;
+  height:100vh;
+}
+.box{
+  background:#020617;
+  width:360px;
+  padding:25px;
+  border-radius:14px;
+  text-align:center;
+}
+button{
+  width:100%;
+  padding:16px;
+  font-size:18px;
+  border:none;
+  border-radius:40px;
+  cursor:pointer;
+}
+.start{background:#22c55e;}
+.stop{background:#ef4444;color:#fff;}
+.status{margin-top:10px;opacity:.8;}
+</style>
 </head>
 
 <body>
 <div class="box">
   <h3>🎧 Voice AI Call</h3>
   <button id="btn" class="start">🎤 Speak</button>
-  <div class="status" id="status">Idle</div>
-  <div class="log" id="log"></div>
+  <div id="status" class="status">Idle</div>
 </div>
 
 <script>
@@ -57,38 +49,39 @@ const SILENCE_THRESHOLD = 0.02;
 const SILENCE_TIME = 1200;
 
 /* ================= STATE ================= */
-let callActive = false;
-let audioCtx, analyser, micStream, recorder;
+let state = "IDLE"; // IDLE | ARMED | RECORDING | THINKING
+let micStream = null;
+let audioCtx = null;
+let analyser = null;
+let recorder = null;
 let chunks = [];
 let silenceStart = null;
-let currentAudio = null;
-let micStopped = true;
-let waitingForUser = false;
+
+/* detector */
+let detectorStream = null;
+let detectorCtx = null;
+let detectorAnalyser = null;
+let detectorRunning = false;
+
+/* ai audio */
+let aiAudio = null;
 
 /* ================= UI ================= */
 const btn = document.getElementById("btn");
 const status = document.getElementById("status");
-const log = document.getElementById("log");
 
-function addLog(text, cls) {
-  const div = document.createElement("div");
-  div.className = cls;
-  div.innerText = text;
-  log.appendChild(div);
-  log.scrollTop = log.scrollHeight;
-}
+/* ================= START RECORDING ================= */
+async function startRecording(){
+  if (state !== "ARMED") return;
 
-/* ================= MIC START ================= */
-async function startMic() {
-  if (!callActive || !waitingForUser) return;
+  stopDetector();                 // 🔴 ensure detector mic off
+  state = "RECORDING";
+  status.innerText = "Listening...";
 
-  waitingForUser = false;
-  micStopped = false;
-
-  micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
-  audioCtx = new AudioContext({ latencyHint: "interactive" });
+  micStream = await navigator.mediaDevices.getUserMedia({ audio:true });
+  audioCtx = new AudioContext();
   const src = audioCtx.createMediaStreamSource(micStream);
+
   analyser = audioCtx.createAnalyser();
   analyser.fftSize = 2048;
   src.connect(analyser);
@@ -97,143 +90,194 @@ async function startMic() {
   chunks = [];
 
   recorder.ondataavailable = e => chunks.push(e.data);
-  recorder.onstop = sendToWorkflow;
+  recorder.onstop = sendToWebhook;
 
   recorder.start();
   silenceStart = null;
-  status.innerText = "Listening...";
-  listenForSilence();
+
+  detectSilence();
 }
 
-/* ================= MIC STOP ================= */
-function stopMicCompletely() {
-  if (micStopped) return;
-  micStopped = true;
+/* ================= STOP RECORDING ================= */
+function stopRecording(){
+  if (state !== "RECORDING") return;
 
-  if (recorder && recorder.state !== "inactive") recorder.stop();
-  if (micStream) micStream.getTracks().forEach(t => t.stop());
-  if (audioCtx) audioCtx.close();
+  state = "THINKING";
+  status.innerText = "Thinking...";
 
-  micStream = null;
-  audioCtx = null;
-  analyser = null;
+  try { recorder.stop(); } catch {}
+
+  if (micStream){
+    micStream.getTracks().forEach(t=>t.stop());
+    micStream = null;
+  }
+
+  if (audioCtx){
+    audioCtx.close();
+    audioCtx = null;
+  }
+
+  analyser = recorder = null;
 }
 
 /* ================= SILENCE DETECTION ================= */
-function listenForSilence() {
+function detectSilence(){
   const data = new Uint8Array(analyser.fftSize);
 
-  function loop() {
-    if (!callActive || !analyser) return;
+  function loop(){
+    if (state !== "RECORDING") return;
 
     analyser.getByteTimeDomainData(data);
     let sum = 0;
-    for (let i = 0; i < data.length; i++) {
-      const v = (data[i] - 128) / 128;
-      sum += v * v;
+    for (let i=0;i<data.length;i++){
+      const v=(data[i]-128)/128;
+      sum+=v*v;
     }
-    const volume = Math.sqrt(sum / data.length);
+    const volume = Math.sqrt(sum/data.length);
 
-    if (volume < SILENCE_THRESHOLD) {
+    if (volume < SILENCE_THRESHOLD){
       if (!silenceStart) silenceStart = Date.now();
-      if (Date.now() - silenceStart > SILENCE_TIME) {
-        stopMicCompletely();
+      if (Date.now()-silenceStart > SILENCE_TIME){
+        stopRecording();          // 🔇 user stopped
         return;
       }
-    } else {
-      silenceStart = null;
-    }
+    } else silenceStart = null;
+
     requestAnimationFrame(loop);
   }
   loop();
 }
 
 /* ================= SEND TO N8N ================= */
-async function sendToWorkflow() {
-  if (!callActive || chunks.length === 0) return;
+async function sendToWebhook(){
+  if (chunks.length === 0){
+    state = "ARMED";
+    status.innerText = "Waiting for user...";
+    startDetector();
+    return;
+  }
 
-  status.innerText = "Thinking...";
-  addLog("🧑 User spoke", "user");
-
-  const blob = new Blob(chunks, { type: "audio/webm" });
+  const blob = new Blob(chunks,{type:"audio/webm"});
   chunks = [];
 
   const fd = new FormData();
-  fd.append("audio", blob, "voice.webm");
+  fd.append("audio",blob,"voice.webm");
 
-  const res = await fetch(WEBHOOK_URL, {
-    method: "POST",
-    body: fd
-  });
-
-  if (!res.ok) {
-    status.innerText = "Server error";
+  const res = await fetch(WEBHOOK_URL,{method:"POST",body:fd});
+  if (!res.ok){
+    state = "ARMED";
+    status.innerText = "Waiting for user...";
+    startDetector();
     return;
   }
 
   const buffer = await res.arrayBuffer();
-  const audioBlob = new Blob([buffer]);
-  currentAudio = new Audio(URL.createObjectURL(audioBlob));
+  aiAudio = new Audio(URL.createObjectURL(new Blob([buffer])));
 
   status.innerText = "Replying...";
-  addLog("🤖 AI replied", "ai");
+  await aiAudio.play();
 
-  await currentAudio.play();
-
-  currentAudio.onended = () => {
-    if (!callActive) return;
+  aiAudio.onended = ()=>{
+    aiAudio = null;
+    state = "ARMED";
     status.innerText = "Waiting for user...";
-    waitingForUser = true;   // ✅ mic will start ONLY when user speaks again
+    startDetector();
   };
 }
 
-/* ================= BUTTON ================= */
-btn.onclick = async () => {
-  if (!callActive) {
-    callActive = true;
-    btn.innerText = "⏹ Stop";
-    btn.className = "stop";
-    addLog("📞 Call started", "user");
-    status.innerText = "Waiting for user...";
-    waitingForUser = true;   // mic not started yet
-  } else {
-    callActive = false;
-    btn.innerText = "🎤 Speak";
-    btn.className = "start";
-    status.innerText = "Call ended";
-    addLog("❌ Call ended", "user");
+/* ================= VOICE DETECTOR ================= */
+async function startDetector(){
+  if (detectorRunning || state !== "ARMED") return;
 
-    stopMicCompletely();
-    if (currentAudio) currentAudio.pause();
+  detectorRunning = true;
+  detectorStream = await navigator.mediaDevices.getUserMedia({ audio:true });
+  detectorCtx = new AudioContext();
+  const src = detectorCtx.createMediaStreamSource(detectorStream);
+
+  detectorAnalyser = detectorCtx.createAnalyser();
+  detectorAnalyser.fftSize = 2048;
+  src.connect(detectorAnalyser);
+
+  const data = new Uint8Array(detectorAnalyser.fftSize);
+
+  function detect(){
+    if (!detectorRunning || state !== "ARMED") return;
+
+    detectorAnalyser.getByteTimeDomainData(data);
+    let sum=0;
+    for(let i=0;i<data.length;i++){
+      const v=(data[i]-128)/128;
+      sum+=v*v;
+    }
+    const volume=Math.sqrt(sum/data.length);
+
+    if (volume > SILENCE_THRESHOLD){
+      startRecording(); // 🎤 user speaks
+      return;
+    }
+    requestAnimationFrame(detect);
+  }
+  detect();
+}
+
+/* ================= STOP DETECTOR ================= */
+function stopDetector(){
+  detectorRunning = false;
+
+  if (detectorStream){
+    detectorStream.getTracks().forEach(t=>t.stop());
+    detectorStream = null;
+  }
+  if (detectorCtx){
+    detectorCtx.close();
+    detectorCtx = null;
+  }
+  detectorAnalyser = null;
+}
+
+/* ================= HARD STOP EVERYTHING ================= */
+function hardStopAll(){
+  state = "IDLE";
+
+  stopDetector();
+
+  if (recorder){
+    try { recorder.stop(); } catch {}
+    recorder = null;
+  }
+
+  if (micStream){
+    micStream.getTracks().forEach(t=>t.stop());
+    micStream = null;
+  }
+
+  if (audioCtx){
+    audioCtx.close();
+    audioCtx = null;
+  }
+
+  if (aiAudio){
+    aiAudio.pause();
+    aiAudio.src = "";
+    aiAudio = null;
+  }
+}
+
+/* ================= BUTTON ================= */
+btn.onclick = ()=>{
+  if (state === "IDLE"){
+    state = "ARMED";
+    btn.innerText="⏹ Stop";
+    btn.className="stop";
+    status.innerText="Waiting for user...";
+    startDetector();
+  } else {
+    btn.innerText="🎤 Speak";
+    btn.className="start";
+    status.innerText="Idle";
+    hardStopAll();     // 🔥 FULL MIC SHUTDOWN
   }
 };
-
-/* ================= AUTO VOICE TRIGGER ================= */
-navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
-  const ctx = new AudioContext();
-  const src = ctx.createMediaStreamSource(stream);
-  const analyserNode = ctx.createAnalyser();
-  analyserNode.fftSize = 2048;
-  src.connect(analyserNode);
-
-  const data = new Uint8Array(analyserNode.fftSize);
-
-  function detectVoice() {
-    analyserNode.getByteTimeDomainData(data);
-    let sum = 0;
-    for (let i = 0; i < data.length; i++) {
-      const v = (data[i] - 128) / 128;
-      sum += v * v;
-    }
-    const volume = Math.sqrt(sum / data.length);
-
-    if (callActive && waitingForUser && volume > SILENCE_THRESHOLD) {
-      startMic();   // 🎯 ONLY HERE mic starts
-    }
-    requestAnimationFrame(detectVoice);
-  }
-  detectVoice();
-});
 </script>
 </body>
 </html>
