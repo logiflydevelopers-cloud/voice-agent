@@ -45,8 +45,10 @@ button{
 <script>
 /* ================= CONFIG ================= */
 const WEBHOOK_URL = "https://newsworld.app.n8n.cloud/webhook/voice-agent";
-const SILENCE_THRESHOLD = 0.02;
-const SILENCE_TIME = 1200;
+
+/* tuned for speech */
+const SILENCE_THRESHOLD = 0.015;
+const SILENCE_TIME = 2000;
 
 /* ================= STATE ================= */
 let state = "IDLE"; // IDLE | ARMED | RECORDING | THINKING
@@ -70,29 +72,43 @@ let aiAudio = null;
 const btn = document.getElementById("btn");
 const status = document.getElementById("status");
 
+/* ================= AUDIO CONSTRAINTS ================= */
+const AUDIO_CONSTRAINTS = {
+  audio: {
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: true,
+    channelCount: 1,
+    sampleRate: 44100
+  }
+};
+
 /* ================= START RECORDING ================= */
 async function startRecording(){
   if (state !== "ARMED") return;
 
-  stopDetector();                 // 🔴 ensure detector mic off
+  stopDetector();                 // stop detector mic
   state = "RECORDING";
   status.innerText = "Listening...";
 
-  micStream = await navigator.mediaDevices.getUserMedia({ audio:true });
-  audioCtx = new AudioContext();
+  micStream = await navigator.mediaDevices.getUserMedia(AUDIO_CONSTRAINTS);
+  audioCtx = new AudioContext({ sampleRate: 44100 });
   const src = audioCtx.createMediaStreamSource(micStream);
 
   analyser = audioCtx.createAnalyser();
   analyser.fftSize = 2048;
   src.connect(analyser);
 
-  recorder = new MediaRecorder(micStream);
-  chunks = [];
+  recorder = new MediaRecorder(micStream, {
+    mimeType: "audio/webm;codecs=opus",
+    audioBitsPerSecond: 128000
+  });
 
+  chunks = [];
   recorder.ondataavailable = e => chunks.push(e.data);
   recorder.onstop = sendToWebhook;
 
-  recorder.start();
+  recorder.start(300);            // continuous buffer
   silenceStart = null;
 
   detectSilence();
@@ -138,7 +154,7 @@ function detectSilence(){
     if (volume < SILENCE_THRESHOLD){
       if (!silenceStart) silenceStart = Date.now();
       if (Date.now()-silenceStart > SILENCE_TIME){
-        stopRecording();          // 🔇 user stopped
+        stopRecording();          // user finished
         return;
       }
     } else silenceStart = null;
@@ -190,8 +206,8 @@ async function startDetector(){
   if (detectorRunning || state !== "ARMED") return;
 
   detectorRunning = true;
-  detectorStream = await navigator.mediaDevices.getUserMedia({ audio:true });
-  detectorCtx = new AudioContext();
+  detectorStream = await navigator.mediaDevices.getUserMedia(AUDIO_CONSTRAINTS);
+  detectorCtx = new AudioContext({ sampleRate: 44100 });
   const src = detectorCtx.createMediaStreamSource(detectorStream);
 
   detectorAnalyser = detectorCtx.createAnalyser();
@@ -212,7 +228,7 @@ async function startDetector(){
     const volume=Math.sqrt(sum/data.length);
 
     if (volume > SILENCE_THRESHOLD){
-      startRecording(); // 🎤 user speaks
+      startRecording(); // user speaks
       return;
     }
     requestAnimationFrame(detect);
@@ -275,7 +291,7 @@ btn.onclick = ()=>{
     btn.innerText="🎤 Speak";
     btn.className="start";
     status.innerText="Idle";
-    hardStopAll();     // 🔥 FULL MIC SHUTDOWN
+    hardStopAll();     // full mic shutdown
   }
 };
 </script>
