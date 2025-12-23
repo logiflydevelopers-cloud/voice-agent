@@ -62,7 +62,8 @@ let audioCtx, analyser, micStream, recorder;
 let chunks = [];
 let silenceStart = null;
 let currentAudio = null;
-let micStopped = false;
+let micStopped = true;
+let waitingForUser = false;
 
 /* ================= UI ================= */
 const btn = document.getElementById("btn");
@@ -77,9 +78,13 @@ function addLog(text, cls) {
   log.scrollTop = log.scrollHeight;
 }
 
-/* ================= MIC ================= */
+/* ================= MIC START ================= */
 async function startMic() {
+  if (!callActive || !waitingForUser) return;
+
+  waitingForUser = false;
   micStopped = false;
+
   micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
   audioCtx = new AudioContext({ latencyHint: "interactive" });
@@ -96,9 +101,11 @@ async function startMic() {
 
   recorder.start();
   silenceStart = null;
+  status.innerText = "Listening...";
   listenForSilence();
 }
 
+/* ================= MIC STOP ================= */
 function stopMicCompletely() {
   if (micStopped) return;
   micStopped = true;
@@ -161,13 +168,10 @@ async function sendToWorkflow() {
 
   if (!res.ok) {
     status.innerText = "Server error";
-    console.error("Webhook error", res.status);
     return;
   }
 
   const buffer = await res.arrayBuffer();
-
-  /* ✅ DO NOT FORCE MIME TYPE */
   const audioBlob = new Blob([buffer]);
   currentAudio = new Audio(URL.createObjectURL(audioBlob));
 
@@ -176,10 +180,10 @@ async function sendToWorkflow() {
 
   await currentAudio.play();
 
-  currentAudio.onended = async () => {
+  currentAudio.onended = () => {
     if (!callActive) return;
-    status.innerText = "Listening...";
-    await startMic();
+    status.innerText = "Waiting for user...";
+    waitingForUser = true;   // ✅ mic will start ONLY when user speaks again
   };
 }
 
@@ -189,9 +193,9 @@ btn.onclick = async () => {
     callActive = true;
     btn.innerText = "⏹ Stop";
     btn.className = "stop";
-    status.innerText = "Listening...";
     addLog("📞 Call started", "user");
-    await startMic();
+    status.innerText = "Waiting for user...";
+    waitingForUser = true;   // mic not started yet
   } else {
     callActive = false;
     btn.innerText = "🎤 Speak";
@@ -203,6 +207,33 @@ btn.onclick = async () => {
     if (currentAudio) currentAudio.pause();
   }
 };
+
+/* ================= AUTO VOICE TRIGGER ================= */
+navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+  const ctx = new AudioContext();
+  const src = ctx.createMediaStreamSource(stream);
+  const analyserNode = ctx.createAnalyser();
+  analyserNode.fftSize = 2048;
+  src.connect(analyserNode);
+
+  const data = new Uint8Array(analyserNode.fftSize);
+
+  function detectVoice() {
+    analyserNode.getByteTimeDomainData(data);
+    let sum = 0;
+    for (let i = 0; i < data.length; i++) {
+      const v = (data[i] - 128) / 128;
+      sum += v * v;
+    }
+    const volume = Math.sqrt(sum / data.length);
+
+    if (callActive && waitingForUser && volume > SILENCE_THRESHOLD) {
+      startMic();   // 🎯 ONLY HERE mic starts
+    }
+    requestAnimationFrame(detectVoice);
+  }
+  detectVoice();
+});
 </script>
 </body>
 </html>
